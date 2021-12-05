@@ -801,3 +801,24 @@ func (p *H265Packet) Unmarshal(payload []byte) ([]byte, error) {
 func (p *H265Packet) Packet() isH265Packet {
 	return p.packet
 }
+
+// H265Payloader payloads packets. use the simplest way.
+type H265Payloader struct{}
+
+// Payload fragments an  packet across one or more byte arrays
+func (p *H265Payloader) Payload(mtu uint16, payload []byte) [][]byte {
+	var out [][]byte
+	if payload == nil || mtu == 0 {
+		return out
+	}
+
+	for len(payload) > int(mtu) {
+		o := make([]byte, mtu)
+		copy(o, payload[:mtu])
+		payload = payload[mtu:]
+		out = append(out, o)
+	}
+	o := make([]byte, len(payload))
+	copy(o, payload)
+	return append(out, o)
+}
