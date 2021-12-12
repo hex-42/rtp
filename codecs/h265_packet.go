@@ -3,6 +3,8 @@ package codecs
 import (
 	"errors"
 	"fmt"
+	"log"
+	"os"
 )
 
 //
@@ -802,23 +804,105 @@ func (p *H265Packet) Packet() isH265Packet {
 	return p.packet
 }
 
-// H265Payloader payloads packets. use the simplest way.
-type H265Payloader struct{}
+// H265Payloader payloads H265 packets
+type H265Payloader struct {
+	DumpFile     bool
+	DebugLog     bool
+	h265DumpFile *os.File
+}
 
-// Payload fragments an  packet across one or more byte arrays
+const (
+	KHz          = 90 // 90000Hz
+	FU_START     = 0x80
+	FU_END       = 0x40
+	N_FU_HEADER  = 3
+	FU_HEAD_MASK = 0x3F
+)
+
+// Payload fragments a H265 packet across one or more byte arrays
+// from https://github.com/ireader/media-server/blob/master/librtp/payload/rtp-h265-pack.c
 func (p *H265Payloader) Payload(mtu uint16, payload []byte) [][]byte {
-	var out [][]byte
-	if payload == nil || mtu == 0 {
-		return out
+	payloads := make([][]byte, 0)
+	if len(payload) == 0 {
+		return payloads
 	}
 
-	for len(payload) > int(mtu) {
-		o := make([]byte, mtu)
-		copy(o, payload[:mtu])
-		payload = payload[mtu:]
-		out = append(out, o)
+	if p.DumpFile && p.h265DumpFile == nil {
+		p.h265DumpFile, _ = os.Create("rtp_dump.h265")
 	}
-	o := make([]byte, len(payload))
-	copy(o, payload)
-	return append(out, o)
+
+	rtp_h264_annexb_nalu(payload, len(payload), func(nalu []byte, bytes int, last bool) int {
+		p.h265DumpFile.Write([]byte{0x00, 0x00, 0x00, 0x01})
+
+		if bytes <= int(mtu) {
+			// single nalu
+			payloads = append(payloads, nalu[0:bytes])
+
+			if p.DebugLog {
+				log.Println(fmt.Sprintf("single nalu %v: %v", bytes, nalu[0:bytes]))
+			}
+			if p.DumpFile && p.h265DumpFile == nil {
+				p.h265DumpFile.Write(nalu[0:bytes])
+			}
+		} else {
+			// h265NaluFragmentationUnitType
+			fu_header := (nalu[0] >> 1) & FU_HEAD_MASK
+
+			if p.DumpFile && p.h265DumpFile == nil {
+				p.h265DumpFile.Write(nalu[0:2]) // write NALU Type
+			}
+
+			index := 2 // skip NAL Unit Type byte
+			bytes -= 2
+			if bytes < 0 {
+				return -1001
+			}
+
+			// FU-A start
+			fu_header |= FU_START
+			for bytes > 0 {
+				var payloadlen int
+				if bytes <= int(mtu-N_FU_HEADER) {
+					if (fu_header & FU_START) != 0 {
+						return -1000
+					}
+					fu_header = FU_END | (fu_header & FU_HEAD_MASK) // FU end
+					payloadlen = bytes
+				} else {
+					payloadlen = int(mtu - N_FU_HEADER)
+				}
+
+				naluWithFuHeader := make([]byte, payloadlen+N_FU_HEADER)
+				naluWithFuHeader[0] = 49 << 1 // h265NaluFragmentationUnitType
+				naluWithFuHeader[1] = 1
+				naluWithFuHeader[2] = fu_header
+				copy(naluWithFuHeader[3:], nalu[index:index+payloadlen])
+
+				if p.DumpFile && p.h265DumpFile == nil {
+					p.h265DumpFile.Write(nalu[index : index+payloadlen])
+				}
+
+				if p.DebugLog {
+					printLen := 12
+					if len(naluWithFuHeader) < 12 {
+						printLen = len(naluWithFuHeader)
+					}
+					log.Println(fmt.Sprintf("multi nalu %v: %v", len(naluWithFuHeader), naluWithFuHeader[0:printLen]))
+				}
+
+				payloads = append(payloads, naluWithFuHeader)
+
+				bytes -= payloadlen
+				index += payloadlen
+				fu_header &= FU_HEAD_MASK // clear flags
+			}
+		}
+		return 0
+	})
+
+	if p.DebugLog {
+		log.Println(fmt.Sprintf("H265Payloader mtu %v size %d pkts %v", mtu, len(payload), len(payloads)))
+	}
+
+	return payloads
 }
